@@ -1,4 +1,4 @@
-name = "meo-harness"
+name = "openmeo"
 main = "worker/index.mjs"
 compatibility_date = "2024-11-01"
 workers_dev = true
