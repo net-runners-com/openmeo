@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getGbpAccessToken, fetchGbpReviews, normalizeGbpReview, postGbpReply, listGbpAccounts, listGbpLocations } from '../src/gbp.mjs';
+import {
+  getGbpAccessToken, fetchGbpReviews, normalizeGbpReview, postGbpReply,
+  listGbpAccounts, listGbpLocations, buildGbpLocationPatch, updateGbpLocation,
+} from '../src/gbp.mjs';
 
 function mockFetch(status, body) {
   return async () => ({
@@ -211,4 +214,80 @@ test('listGbpLocations: URL に accountId と v1 が含まれる', async () => {
   await listGbpLocations({ accessToken: 'tok', accountId: 'accounts/99', fetchImpl: spyFetch });
   assert.ok(capturedUrl.includes('mybusinessbusinessinformation.googleapis.com/v1'), `URL should use v1 sub-API, got: ${capturedUrl}`);
   assert.ok(capturedUrl.includes('accounts/99'), `URL should include accountId, got: ${capturedUrl}`);
+});
+
+// ── buildGbpLocationPatch ──────────────────────────────────────────────────────
+
+test('buildGbpLocationPatch: title のみ → location.title + updateMask="title"', () => {
+  const { location, updateMask } = buildGbpLocationPatch({ title: '山田カフェ 難波店' });
+  assert.deepEqual(location, { title: '山田カフェ 難波店' });
+  assert.equal(updateMask, 'title');
+});
+
+test('buildGbpLocationPatch: phoneNumber → phoneNumbers.primaryPhone', () => {
+  const { location, updateMask } = buildGbpLocationPatch({ phoneNumber: '+81312345678' });
+  assert.deepEqual(location, { phoneNumbers: { primaryPhone: '+81312345678' } });
+  assert.equal(updateMask, 'phoneNumbers');
+});
+
+test('buildGbpLocationPatch: description → profile.description', () => {
+  const { location, updateMask } = buildGbpLocationPatch({ description: '地元密着のカフェです' });
+  assert.deepEqual(location, { profile: { description: '地元密着のカフェです' } });
+  assert.equal(updateMask, 'profile');
+});
+
+test('buildGbpLocationPatch: regularHours → { periods } でラップ', () => {
+  const periods = [{ openDay: 'MONDAY', openTime: { hours: 9 }, closeDay: 'MONDAY', closeTime: { hours: 18 } }];
+  const { location, updateMask } = buildGbpLocationPatch({ regularHours: periods });
+  assert.deepEqual(location, { regularHours: { periods } });
+  assert.equal(updateMask, 'regularHours');
+});
+
+test('buildGbpLocationPatch: 複数フィールド → updateMask はカンマ区切り', () => {
+  const { location, updateMask } = buildGbpLocationPatch({ title: '新店名', websiteUri: 'https://example.com' });
+  assert.deepEqual(location, { title: '新店名', websiteUri: 'https://example.com' });
+  assert.equal(updateMask, 'title,websiteUri');
+});
+
+test('buildGbpLocationPatch: フィールドなし → エラー', () => {
+  assert.throws(() => buildGbpLocationPatch({}), /更新するフィールドがありません/);
+});
+
+// ── updateGbpLocation ────────────────────────────────────────────────────────
+
+test('updateGbpLocation: 成功 → 更新後の location を返す', async () => {
+  const updated = await updateGbpLocation({
+    accessToken: 'tok', locationId: 'locations/456',
+    location: { title: '新店名' }, updateMask: 'title',
+    fetchImpl: mockFetch(200, { name: 'locations/456', title: '新店名' }),
+  });
+  assert.equal(updated.title, '新店名');
+});
+
+test('updateGbpLocation: 403 → エラー', async () => {
+  await assert.rejects(
+    () => updateGbpLocation({
+      accessToken: 'bad', locationId: 'locations/456',
+      location: { title: 'x' }, updateMask: 'title',
+      fetchImpl: mockFetch(403, { error: { message: 'PERMISSION_DENIED' } }),
+    }),
+    /GBP location 更新失敗 403/,
+  );
+});
+
+test('updateGbpLocation: URL に PATCH 対象 locationId と updateMask が含まれる', async () => {
+  let capturedUrl, capturedMethod;
+  const spyFetch = async (url, opts) => {
+    capturedUrl = url;
+    capturedMethod = opts.method;
+    return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
+  };
+  await updateGbpLocation({
+    accessToken: 'tok', locationId: 'locations/456',
+    location: { title: 'x' }, updateMask: 'title,websiteUri',
+    fetchImpl: spyFetch,
+  });
+  assert.equal(capturedMethod, 'PATCH');
+  assert.ok(capturedUrl.includes('mybusinessbusinessinformation.googleapis.com/v1/locations/456'), `got: ${capturedUrl}`);
+  assert.ok(capturedUrl.includes('updateMask=title%2CwebsiteUri'), `got: ${capturedUrl}`);
 });

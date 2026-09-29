@@ -108,6 +108,75 @@ export async function listGbpLocations({ accessToken, accountId, fetchImpl }) {
   return data.locations ?? [];
 }
 
+/**
+ * 編集可能なフィールドから GBP location.patch 用の { location, updateMask } を組み立てる。
+ * @param {object} fields
+ * @param {string} [fields.title]         店舗名
+ * @param {string} [fields.phoneNumber]   電話番号（例: "+81312345678"）
+ * @param {string} [fields.websiteUri]    ウェブサイト URL
+ * @param {string} [fields.description]   店舗紹介文（profile.description）
+ * @param {Array}  [fields.regularHours]  営業時間 periods 配列（GBP API 形式）
+ * @returns {{location: object, updateMask: string}}
+ */
+export function buildGbpLocationPatch(fields) {
+  const location = {};
+  const maskParts = [];
+
+  if (fields.title !== undefined) {
+    location.title = fields.title;
+    maskParts.push('title');
+  }
+  if (fields.phoneNumber !== undefined) {
+    location.phoneNumbers = { primaryPhone: fields.phoneNumber };
+    maskParts.push('phoneNumbers');
+  }
+  if (fields.websiteUri !== undefined) {
+    location.websiteUri = fields.websiteUri;
+    maskParts.push('websiteUri');
+  }
+  if (fields.description !== undefined) {
+    location.profile = { description: fields.description };
+    maskParts.push('profile');
+  }
+  if (fields.regularHours !== undefined) {
+    location.regularHours = { periods: fields.regularHours };
+    maskParts.push('regularHours');
+  }
+
+  if (!maskParts.length) {
+    throw new Error('更新するフィールドがありません（title, phoneNumber, websiteUri, description, regularHours のいずれか必須）');
+  }
+
+  return { location, updateMask: maskParts.join(',') };
+}
+
+/**
+ * GBP 店舗情報を更新する（部分更新 / PATCH）。
+ * @param {object} args
+ * @param {string} args.accessToken
+ * @param {string} args.locationId  "locations/987654321" 形式
+ * @param {object} args.location    更新するフィールドのみを含む Location リソース
+ * @param {string} args.updateMask  更新するトップレベルフィールド名（カンマ区切り）
+ * @param {function} [args.fetchImpl]
+ */
+export async function updateGbpLocation({ accessToken, locationId, location, updateMask, fetchImpl }) {
+  const _fetch = fetchImpl ?? globalThis.fetch;
+  const url = `${GBP_LOCATIONS_BASE}/${locationId}?updateMask=${encodeURIComponent(updateMask)}`;
+  const res = await _fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(location),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`GBP location 更新失敗 ${res.status}: ${body.slice(0, 200)}`);
+  }
+  return await res.json();
+}
+
 export async function postGbpReply({ accessToken, accountId, locationId, reviewId, comment, fetchImpl }) {
   const _fetch = fetchImpl ?? globalThis.fetch;
   const url = `${GBP_REVIEWS_BASE}/${accountId}/${locationId}/reviews/${reviewId}/reply`;

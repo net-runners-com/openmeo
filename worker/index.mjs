@@ -6,7 +6,13 @@
 //   POST /webhook/:platform                   — 外部 Webhook（Yelp/Trustpilot/Yahoo!プレイス）
 //   POST /webhook/line-bot                    — LINE Messaging API Webhook（postback処理）
 //   POST /signup                              — 設置ウィザード用・公開エンドポイント
+//   GET  /admin                               — 管理ダッシュボード（ブラウザで開く HTML 画面）
 //   GET  /admin/stores/:storeId/status        — 店舗ステータス確認（X-Admin-Key: ADMIN_KEY）
+//   GET  /admin/stores/:storeId/gbp/locations  — GBP アカウント/ロケーション一覧（X-Admin-Key: ADMIN_KEY）
+//   PATCH /admin/stores/:storeId/gbp/location  — GBP 店舗情報を編集（店名/電話/営業時間等・X-Admin-Key: ADMIN_KEY）
+//   GET  /admin/stores/:storeId/pending                    — 保留中レビュー一覧（X-Admin-Key: ADMIN_KEY）
+//   POST /admin/stores/:storeId/pending/:replyId/approve   — レビューを承認しGoogleに返信投稿（X-Admin-Key: ADMIN_KEY）
+//   POST /admin/stores/:storeId/pending/:replyId/skip      — レビューを却下（X-Admin-Key: ADMIN_KEY）
 //   PUT  /admin/stores/:storeId               — 店舗設定を KV に登録（X-Admin-Key: ADMIN_KEY）
 //   DELETE /admin/stores/:storeId             — 店舗設定を KV から削除（X-Admin-Key: ADMIN_KEY）
 //   POST /admin/stores/:storeId/notify/test   — テスト通知を送信（X-Admin-Key: ADMIN_KEY）
@@ -31,6 +37,7 @@ import { generateReply, PROVIDERS } from '../src/reply-engine.mjs';
 import { verifyLineCredentials } from '../src/line-notify.mjs';
 import { sendDigest } from '../src/notify.mjs';
 import { mergePendingReviews, shouldSendDigest, isDigestHour } from '../src/cron.mjs';
+import { renderAdminDashboard } from './admin-ui.mjs';
 
 export default {
   async fetch(request, env, ctx) {
@@ -41,6 +48,12 @@ export default {
     try {
       if (method === 'GET' && path === '/health') {
         return json({ status: 'ok', version: env.VERSION ?? '0.1.0' });
+      }
+
+      if (method === 'GET' && (path === '/admin' || path === '/admin/')) {
+        return new Response(renderAdminDashboard(), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
       }
 
       if (method === 'POST' && path === '/review') {
@@ -90,6 +103,24 @@ export default {
         if (rest.endsWith('/gbp/locations')) {
           const storeId = rest.slice(0, -'/gbp/locations'.length);
           if (method === 'GET') return await handleGbpLocations(request, env, storeId);
+        }
+
+        if (rest.endsWith('/gbp/location')) {
+          const storeId = rest.slice(0, -'/gbp/location'.length);
+          if (method === 'PATCH') return await handleGbpLocationUpdate(request, env, storeId);
+        }
+
+        const pendingActionMatch = rest.match(/^(.+)\/pending\/([^/]+)\/(approve|skip)$/);
+        if (pendingActionMatch && method === 'POST') {
+          const [, storeId, replyId, action] = pendingActionMatch;
+          return action === 'approve'
+            ? await handlePendingApprove(request, env, storeId, replyId)
+            : await handlePendingSkip(request, env, storeId, replyId);
+        }
+
+        if (rest.endsWith('/pending')) {
+          const storeId = rest.slice(0, -'/pending'.length);
+          if (method === 'GET') return await handlePendingList(request, env, storeId);
         }
 
         if (rest.endsWith('/status')) {
@@ -781,6 +812,135 @@ async function handleGbpLocations(request, env, storeId) {
   );
 
   return json({ ok: true, storeId, locationsByAccount });
+}
+
+// ── /admin/stores/:storeId/gbp/location（店舗情報の編集） ────────────────────
+//
+// PATCH body 例:
+//   { "title": "山田カフェ 難波店", "phoneNumber": "+81312345678",
+//     "websiteUri": "https://example.com", "description": "…",
+//     "regularHours": [{ "openDay": "MONDAY", "openTime": {"hours":9}, "closeDay": "MONDAY", "closeTime": {"hours":18} }] }
+//
+// 渡したフィールドのみ更新される（部分更新）。
+
+async function handleGbpLocationUpdate(request, env, storeId) {
+  if (!checkAdminAuth(request, env)) return jsonError('Unauthorized', 401);
+
+  const storeRaw = await env.STORES.get(`store:${storeId}`);
+  if (!storeRaw) return jsonError(`Unknown store: ${storeId}`, 404);
+  const store = JSON.parse(storeRaw);
+  if (!store.gbpRefreshToken || !store.gbpLocationId) {
+    return jsonError('GBP OAuth 未完了、または gbpLocationId が未設定です', 400);
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return jsonError('Invalid JSON body', 400); }
+
+  const { buildGbpLocationPatch, getGbpAccessToken, updateGbpLocation } = await import('../src/gbp.mjs');
+
+  let patch;
+  try {
+    patch = buildGbpLocationPatch(body ?? {});
+  } catch (err) {
+    return jsonError(err.message, 400);
+  }
+
+  const accessToken = await getGbpAccessToken({
+    clientId: env.GBP_OAUTH_CLIENT_ID,
+    clientSecret: env.GBP_OAUTH_CLIENT_SECRET,
+    refreshToken: store.gbpRefreshToken,
+  });
+
+  let updated;
+  try {
+    updated = await updateGbpLocation({
+      accessToken,
+      locationId: store.gbpLocationId,
+      location: patch.location,
+      updateMask: patch.updateMask,
+    });
+  } catch (err) {
+    return jsonError(err.message, 502);
+  }
+
+  return json({ ok: true, storeId, updated });
+}
+
+// ── /admin/stores/:storeId/pending（保留中レビューの一覧・承認・却下） ────────
+//
+// 承認は reviewId を持つレビュー（GBP 由来）のみ可能。他プラットフォームのレビューは
+// pending 一覧には出るが、Google への返信投稿は対象外（フロント側で非表示にする）。
+
+async function handlePendingList(request, env, storeId) {
+  if (!checkAdminAuth(request, env)) return jsonError('Unauthorized', 401);
+  const storeRaw = await env.STORES.get(`store:${storeId}`);
+  if (!storeRaw) return jsonError(`Unknown store: ${storeId}`, 404);
+
+  const pendingRaw = await env.STORES.get(`pending:${storeId}`);
+  const pending = pendingRaw ? JSON.parse(pendingRaw) : [];
+  return json({ ok: true, storeId, pending });
+}
+
+async function handlePendingApprove(request, env, storeId, replyId) {
+  if (!checkAdminAuth(request, env)) return jsonError('Unauthorized', 401);
+
+  const replyRaw = await env.STORES.get(`reply:${replyId}`);
+  if (!replyRaw) return jsonError(`Unknown reply: ${replyId}`, 404);
+  const reply = JSON.parse(replyRaw);
+  if (reply.storeId !== storeId) return jsonError(`Unknown reply: ${replyId}`, 404);
+
+  const storeRaw = await env.STORES.get(`store:${storeId}`);
+  if (!storeRaw) return jsonError(`Unknown store: ${storeId}`, 404);
+  const store = JSON.parse(storeRaw);
+
+  let body = {};
+  try { body = await request.json(); } catch { /* body は省略可（draft をそのまま使う） */ }
+  const comment = body?.comment ?? reply.draft;
+  if (!comment) return jsonError('返信内容がありません（comment を指定するか draft を用意してください）', 400);
+
+  const { getGbpAccessToken, postGbpReply } = await import('../src/gbp.mjs');
+  const accessToken = await getGbpAccessToken({
+    clientId: env.GBP_OAUTH_CLIENT_ID,
+    clientSecret: env.GBP_OAUTH_CLIENT_SECRET,
+    refreshToken: store.gbpRefreshToken,
+  });
+
+  try {
+    await postGbpReply({
+      accessToken, accountId: reply.gbpAccountId, locationId: reply.gbpLocationId,
+      reviewId: reply.reviewId, comment,
+    });
+  } catch (err) {
+    return jsonError(err.message, 502);
+  }
+
+  await env.STORES.delete(`reply:${replyId}`);
+  await removeFromPending(env, storeId, replyId);
+
+  return json({ ok: true, storeId, replyId, posted: true });
+}
+
+async function handlePendingSkip(request, env, storeId, replyId) {
+  if (!checkAdminAuth(request, env)) return jsonError('Unauthorized', 401);
+
+  const replyRaw = await env.STORES.get(`reply:${replyId}`);
+  if (replyRaw) {
+    const reply = JSON.parse(replyRaw);
+    if (reply.storeId === storeId) await env.STORES.delete(`reply:${replyId}`);
+  }
+  await removeFromPending(env, storeId, replyId);
+
+  return json({ ok: true, storeId, replyId, skipped: true });
+}
+
+async function removeFromPending(env, storeId, replyId) {
+  const pendingRaw = await env.STORES.get(`pending:${storeId}`);
+  if (!pendingRaw) return;
+  const pending = JSON.parse(pendingRaw);
+  const filtered = pending.filter(r => r.replyId !== replyId);
+  if (filtered.length === pending.length) return;
+  if (filtered.length === 0) await env.STORES.delete(`pending:${storeId}`);
+  else await env.STORES.put(`pending:${storeId}`, JSON.stringify(filtered), { expirationTtl: 7 * 24 * 3600 });
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
