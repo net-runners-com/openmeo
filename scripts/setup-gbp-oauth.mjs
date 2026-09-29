@@ -38,7 +38,11 @@ if (!GBP_OAUTH_CLIENT_ID || !GBP_OAUTH_CLIENT_SECRET) {
 
 const PORT = 4100;
 const REDIRECT_URI = `http://localhost:${PORT}/callback`;
-const SCOPE = 'https://www.googleapis.com/auth/business.manage';
+// --gmail: GBP 審査前の Gmail 監視ブリッジ用（読み取り専用スコープ）
+const GMAIL_MODE = process.argv.includes('--gmail');
+const SCOPE = GMAIL_MODE
+  ? 'https://www.googleapis.com/auth/gmail.readonly'
+  : 'https://www.googleapis.com/auth/business.manage';
 
 // ── Step 1: 認証 URL を組み立ててブラウザで開く ───────────────────────────────
 
@@ -132,18 +136,26 @@ if (!tokenRes.ok || !tokenData.refresh_token) {
 }
 
 const refreshToken = tokenData.refresh_token;
+const secretName = GMAIL_MODE ? 'GMAIL_REFRESH_TOKEN' : 'GBP_REFRESH_TOKEN';
 console.log('\n✅ 認証成功！\n');
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-console.log('🔑 refresh_token（以下を Keychain に保存してください）:');
+console.log(`🔑 refresh_token（${secretName} として保存してください）:`);
 console.log('');
 console.log(refreshToken);
 console.log('');
 console.log('  保存コマンド:');
-console.log(`  security add-generic-password -a "$USER" -s GBP_REFRESH_TOKEN -w '${refreshToken}' -U`);
+console.log(`  security add-generic-password -a "$USER" -s ${secretName} -w '${refreshToken}' -U`);
+console.log(`  Worker へは: npx wrangler secret put ${secretName}`);
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 console.log('');
 
 // ── Step 4: アカウント/ロケーション ID を取得 ─────────────────────────────────
+
+if (GMAIL_MODE) {
+  console.log('Gmail モード: GBP アカウント取得はスキップします。');
+  console.log('次: .dev.vars に GMAIL_REFRESH_TOKEN を書き、node scripts/check-review-emails.mjs で疎通確認。');
+  process.exit(0);
+}
 
 console.log('🔍 GBP アカウントとロケーションを取得中...');
 const accountsRes = await fetch('https://mybusiness.googleapis.com/v4/accounts', {
@@ -201,7 +213,8 @@ console.log('══════════════════════�
 console.log('次のステップ（以下をターミナルで実行してください）:');
 console.log('');
 console.log('【1】refresh_token を Keychain に保存:');
-console.log(`  security add-generic-password -a "$USER" -s GBP_REFRESH_TOKEN -w '${refreshToken}' -U`);
+console.log(`  security add-generic-password -a "$USER" -s ${secretName} -w '${refreshToken}' -U`);
+console.log(`  Worker へは: npx wrangler secret put ${secretName}`);
 console.log('');
 console.log('【2】Claude に以下を伝えて Worker と店舗に設定してもらう:');
 console.log('');
